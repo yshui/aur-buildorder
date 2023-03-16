@@ -1,23 +1,27 @@
-#![feature(never_type)]
+#![feature(never_type, exit_status_error)]
+mod pty;
 use alpm::SigLevel;
 use anyhow::{anyhow, Error};
 use clap::Parser;
-use futures::{stream::FuturesOrdered, TryStreamExt};
+use futures::{stream::FuturesOrdered, StreamExt, TryStreamExt};
+use indicatif::ProgressStyle;
 use ordered_float::NotNan;
+use pty::PtyProcess;
 use serde::{Deserialize, Serialize};
 use srcinfo::Srcinfo;
 use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
-    io::{stderr, stdin, stdout},
+    io::{stderr, stdin, stdout, Cursor, Write},
     os::{
         fd::AsRawFd,
-        unix::{ffi::OsStringExt, prelude::PermissionsExt},
+        unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
 };
 use syscalls::{syscall, Sysno};
-use tokio::sync::oneshot;
+use tokio::{io::AsyncBufReadExt, sync::oneshot};
+use tokio_stream::wrappers::LinesStream;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RunnerCommand {
@@ -88,6 +92,29 @@ impl Unwrap for bool {
         }
     }
 }
+
+struct KillGuard {
+    child: std::process::Child,
+}
+
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.child.kill() {
+            eprintln!("Failed to kill child: {}, pid: {}", e, self.child.id());
+        }
+    }
+}
+
+trait EnsureKill {
+    fn ensure_kill(self) -> KillGuard;
+}
+
+impl EnsureKill for std::process::Child {
+    fn ensure_kill(self) -> KillGuard {
+        KillGuard { child: self }
+    }
+}
+
 fn run_nspawn(
     root: &str,
     command: impl IntoIterator<Item = impl AsRef<OsStr>>,
@@ -156,18 +183,18 @@ fn runner_main() -> Result<!, Error> {
     struct ZfsSnapshot;
     impl ZfsSnapshot {
         fn new() -> Result<Self, Error> {
-            let result = std::process::Command::new("zfs")
+            std::process::Command::new("zfs")
                 .args(["snapshot", "grid/base/root/aurbuild@shui"])
-                .status()?;
-            assert!(result.success());
-            let result = std::process::Command::new("zfs")
+                .status()?
+                .exit_ok()?;
+            std::process::Command::new("zfs")
                 .args(["clone", "-o", "mountpoint=/var/lib/aurbuild/x86_64/shui"])
                 .args([
                     "grid/base/root/aurbuild@shui",
                     "grid/base/root/aurbuild/shui",
                 ])
-                .status()?;
-            assert!(result.success());
+                .status()?
+                .exit_ok()?;
             Ok(Self)
         }
     }
@@ -267,12 +294,49 @@ fn base_dir() -> PathBuf {
         .join("pkgbuilds")
 }
 
+fn is_source_vcs(source: &str) -> bool {
+    if !source.contains("://") {
+        return false;
+    }
+
+    let (_filename, url) = source.split_once("::").unwrap_or(("", source));
+    let (proto, _url) = url.split_once("://").unwrap_or(("", url));
+    let (proto, _transport) = proto.split_once('+').unwrap_or((proto, ""));
+    matches!(proto, "git" | "hg" | "svn" | "bzr")
+}
+
+fn copy_pkgbuild_dir_to_tmp(path: &Path) -> Result<tempfile::TempDir, Error> {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let mut path = path.as_os_str().to_owned();
+    if path.as_bytes().last() != Some(&b'/') {
+        // adds a trailing slash, so rsync copies the contents of the directory
+        // instead of the directory itself
+        path.push("/");
+    }
+    // rsync
+    let cmd = std::process::Command::new("rsync")
+        .args(["-a", "--delete", "--delete-excluded", "--exclude", ".git"])
+        .arg(path)
+        .arg(tmpdir.path())
+        .status()?;
+    if !cmd.success() {
+        Err(anyhow!("Failed to copy pkgbuild dir to tmp"))
+    } else {
+        Ok(tmpdir)
+    }
+}
+
 /// Returns Some(Srcinfo) if update was successful, None if there are conflicts in the git repo
 async fn update_one_repo(
     name: String,
     aur_version: &alpm::Version,
+    update_vcs: bool,
+    progress: indicatif::ProgressBar,
     resolve_conflicts_tx: tokio::sync::mpsc::Sender<ResolveConflicts>,
 ) -> Result<Srcinfo, Error> {
+    progress.set_style(ProgressStyle::with_template(&format!(
+        "[{{spinner:.green}}] {{wide_msg}} [{name}]"
+    ))?);
     let base = base_dir();
     let path = base.join(&name);
     tracing::info!("Processing {}", name);
@@ -353,10 +417,75 @@ async fn update_one_repo(
             srcinfo.version(),
             aur_version
         );
-        if &our_version > aur_version {
+        tracing::info!("Sources: {:?}", srcinfo.base.source);
+        let is_vcs = srcinfo
+            .base
+            .source
+            .iter()
+            .filter(|av| matches!(av.arch.as_deref(), None | Some("any") | Some("x86_64")))
+            .flat_map(|av| av.vec.iter().map(|s| s.as_str()))
+            .any(is_source_vcs);
+        tracing::info!("is_vcs: {}", is_vcs);
+        if &our_version > aur_version && !is_vcs {
             tracing::warn!("{}: Local version {} is newer than AUR", name, our_version);
         }
-        return Ok(srcinfo);
+        return if is_vcs && update_vcs {
+            // Ask makepkg to update sources
+            tracing::info!("VCS source detected, updating");
+            let tmpdir = copy_pkgbuild_dir_to_tmp(&path)?;
+            let mut cmd = tokio::process::Command::new("makepkg");
+            cmd.current_dir(tmpdir.path())
+                .arg("--nodeps")
+                .arg("-o")
+                .arg("SRCDEST=/home/shui/.cache/makepkg/distfiles")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let (pty, mut child) = PtyProcess::spawn(cmd)?;
+            let mut output_stream = LinesStream::new(
+                tokio::io::BufReader::new(tokio::fs::File::from_std(pty.get_raw_handle()?)).lines(),
+            );
+            let mut output = String::new();
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs_f32(0.5));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let status = loop {
+                tokio::select! {
+                    status = child.wait() => {
+                        break status?;
+                    }
+                    line = output_stream.next() => {
+                        match line {
+                            Some(Ok(line)) =>  {
+                                output.push_str(&line);
+                                output.push('\n');
+                                progress.set_message(format!("{}: vcs: {}", srcinfo.base.pkgbase, &line));
+                            },
+                            None => break child.wait().await?,
+                            Some(Err(e)) if e.raw_os_error() == Some(5) => break child.wait().await?, // EIO means the child closed their pts
+                            Some(Err(e)) => tracing::error!("Error reading output: {}", e),
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    _ = timer.tick() => {
+                        progress.inc(1);
+                    }
+                }
+            };
+            if !status.success() {
+                tracing::error!("makepkg failed: {}", status);
+                tracing::error!("Output: {}", output);
+                return Err(anyhow!("makepkg failed"));
+            }
+            let status = std::process::Command::new("makepkg")
+                .arg("--printsrcinfo")
+                .current_dir(tmpdir.path())
+                .output()?;
+            status.status.exit_ok()?;
+            progress.finish_and_clear();
+            Ok(srcinfo::Srcinfo::parse_buf(Cursor::new(status.stdout))?)
+        } else {
+            progress.finish_and_clear();
+            Ok(srcinfo)
+        };
     }
     let (repo, has_conflicts, stashed) = tokio::task::spawn_blocking(move || {
         let current_branch = repo.head()?.shorthand().unwrap().to_owned();
@@ -446,19 +575,23 @@ async fn update_one_repo(
     if stashed {
         // Re-generate srcinfo
         tracing::info!("Regenerating srcinfo");
+        progress.set_message("Regenerating srcinfo");
         let status = std::process::Command::new("makepkg")
             .arg("--printsrcinfo")
-            .stdout(std::fs::File::create(&srcinfo_path)?)
             .current_dir(&path)
-            .status()?;
-        assert!(status.success());
+            .output()?;
+        status.status.exit_ok()?;
+        progress.finish_and_clear();
+        Ok(srcinfo::Srcinfo::parse_buf(Cursor::new(status.stdout))?)
+    } else {
+        progress.finish_and_clear();
+        Ok(srcinfo::Srcinfo::parse_file(srcinfo_path)?)
     }
-    Ok(srcinfo::Srcinfo::parse_file(srcinfo_path)?)
 }
 
 trait Packages {
     fn repo_of(&self, name: &str) -> Vec<&str>;
-    fn repo_package(&self, name: &str) -> Option<alpm::Package>;
+    fn repo_package(&self, name: &str) -> Vec<(&str, alpm::Package)>;
     fn satisfied(&self, name: &str) -> bool;
 }
 
@@ -472,11 +605,14 @@ impl Packages for alpm::Alpm {
             })
             .collect()
     }
-    fn repo_package(&self, name: &str) -> Option<alpm::Package> {
-        self.syncdbs().iter().find_map(|db| {
-            let pkgs = db.pkgs();
-            pkgs.find_satisfier(name)
-        })
+    fn repo_package(&self, name: &str) -> Vec<(&str, alpm::Package)> {
+        self.syncdbs()
+            .iter()
+            .filter_map(|db| {
+                let pkgs = db.pkgs();
+                pkgs.find_satisfier(name).map(|pkg| (db.name(), pkg))
+            })
+            .collect()
     }
     fn satisfied(&self, name: &str) -> bool {
         let db = self.localdb();
@@ -643,11 +779,11 @@ fn build(
                 .join("repo");
             let pkg = Path::new(line);
             std::fs::copy(pkg, dest.join(pkg.file_name().unwrap()))?;
-            let status = std::process::Command::new("repo-add")
+            std::process::Command::new("repo-add")
                 .arg(dest.join("localrepo.db.tar.gz"))
                 .arg(dest.join(pkg.file_name().unwrap()))
-                .status()?;
-            assert!(status.success());
+                .status()?
+                .exit_ok()?;
         }
     } else {
         tracing::info!("Would have run: {:?}", cmd);
@@ -660,11 +796,14 @@ fn build(
 enum Action {
     Update {
         /// Update all packages in local repo
-        #[arg(short, long)]
+        #[arg(short = 'a', long)]
         all: bool,
         /// Update only packages that are installed
-        #[arg(short, long)]
+        #[arg(short = 'i', long)]
         installed: bool,
+        /// Refresh vcs sources
+        #[arg(long)]
+        vcs: bool,
         packages: Vec<String>,
     },
     /// Remove packages from localrepo if they are no longer in the AUR,
@@ -801,8 +940,7 @@ fn check_fd() -> Result<(), Error> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+async fn run() -> Result<(), Error> {
     let opts = Opts::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -812,40 +950,44 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
-    let pacman = pacmanconf::Config::from_file("/etc/pacman.conf").unwrap();
-    let alpm = alpm::Alpm::new("/", &pacman.db_path).unwrap();
+    let pacman = pacmanconf::Config::from_file("/etc/pacman.conf")?;
+    let alpm = alpm::Alpm::new("/", &pacman.db_path)?;
     for repo in pacman.repos {
-        alpm.register_syncdb(repo.name.into_bytes(), alpm::SigLevel::NONE)
-            .unwrap();
+        alpm.register_syncdb(repo.name.into_bytes(), alpm::SigLevel::NONE)?;
     }
     match opts.action {
         Action::CleanUp => {
-            let db = Path::new(std::env::var("HOME").unwrap().as_str())
+            let db = Path::new(std::env::var("HOME")?.as_str())
                 .join(".local")
                 .join("var")
                 .join("repo");
-            let tmpdir = tempfile::tempdir().unwrap();
-            std::fs::create_dir(tmpdir.path().join("sync")).unwrap();
+            let tmpdir = tempfile::tempdir()?;
+            std::fs::create_dir(tmpdir.path().join("sync"))?;
             std::fs::copy(
                 db.join("localrepo.db"),
                 tmpdir.path().join("sync").join("localrepo.db"),
-            )
-            .unwrap();
-            let alpm = alpm::Alpm::new("/", tmpdir.path().to_str().unwrap()).unwrap();
-            alpm.register_syncdb("localrepo", SigLevel::NONE).unwrap();
+            )?;
+            let alpm = alpm::Alpm::new("/", tmpdir.path().to_str().unwrap())?;
+            alpm.register_syncdb("localrepo", SigLevel::NONE)?;
             let files: HashSet<_> = alpm
                 .syncdbs()
                 .iter()
                 .flat_map(|db| db.pkgs().into_iter().map(|pkg| pkg.filename().to_owned()))
                 .collect();
             tracing::info!("Removing files no longer in localrepo");
-            for e in db.read_dir().unwrap().filter_map(|e| e.ok()).filter(|e| {
-                e.file_name().to_str().unwrap().contains(".pkg.tar.")
-                    && !files.contains(e.file_name().to_str().unwrap())
-            }) {
+            for e in db.read_dir()? {
+                let e = e?;
+                if !e.file_name().to_str().unwrap().contains(".pkg.tar.") {
+                    // not a package
+                    continue;
+                }
+                if files.contains(e.file_name().to_str().unwrap()) {
+                    // still in localrepo
+                    continue;
+                }
                 if !opts.dry_run {
                     tracing::info!("Removing {file}", file = e.file_name().to_str().unwrap());
-                    std::fs::remove_file(e.path()).unwrap();
+                    std::fs::remove_file(e.path())?;
                 } else {
                     tracing::info!(
                         "Would have removed {file}",
@@ -868,17 +1010,13 @@ async fn main() {
                     if opts.dry_run {
                         tracing::info!("Would have run: {:?}", cmd);
                     } else {
-                        cmd.status().unwrap();
+                        cmd.status()?;
                     }
-                    for e in db.read_dir().unwrap().filter_map(|e| {
-                        e.ok().and_then(|e| {
-                            e.file_name()
-                                .to_str()
-                                .unwrap()
-                                .starts_with(package.name())
-                                .then_some(e)
-                        })
-                    }) {
+                    for e in db.read_dir()? {
+                        let e = e?;
+                        if !e.file_name().to_str().unwrap().starts_with(package.name()) {
+                            continue;
+                        }
                         // Parse the file name to see if it's a file we want to remove
                         // <pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.<ext>
                         let stem = e
@@ -896,18 +1034,20 @@ async fn main() {
                         if opts.dry_run {
                             tracing::info!("Would have removed: {:?}", e.path());
                         } else {
-                            std::fs::remove_file(e.path()).unwrap();
+                            std::fs::remove_file(e.path())?;
                         }
                     }
                 }
             }
-            return;
+            return Ok(());
         }
-        Action::Runner => runner_main().unwrap(),
+        Action::Runner => runner_main()?,
         _ => (),
     }
+    let multi_progress = indicatif::MultiProgress::new();
     let (resolve_conflicts_tx, mut resolve_conflicts_rx) =
         tokio::sync::mpsc::channel::<ResolveConflicts>(1);
+    let multi_progress2 = multi_progress.clone();
     tokio::spawn(async move {
         while let Some(ResolveConflicts {
             path,
@@ -915,33 +1055,61 @@ async fn main() {
             mut repo,
         }) = resolve_conflicts_rx.recv().await
         {
-            prompt_resolve_conflict(path, &mut repo).unwrap();
-            reply
-                .send(repo)
-                .unwrap_or_else(|_| panic!("Failed to send repo"));
+            multi_progress2.suspend(|| {
+                prompt_resolve_conflict(path, &mut repo).unwrap();
+                reply
+                    .send(repo)
+                    .unwrap_or_else(|_| panic!("Failed to send repo"));
+            });
         }
     });
     let mut dep_graph = petgraph::graph::DiGraph::<DepNode, ()>::new();
     let mut package_base_map = HashMap::new();
     let mut index_map = HashMap::new();
-    let mut pending: HashSet<String> = match opts.action {
+    let (mut pending, update_vcs): (HashSet<String>, _) = match opts.action {
         Action::Update {
             all,
             packages,
+            vcs,
             installed,
         } => {
             assert!(
                 !installed || !all,
                 "Can't use --installed and --all together"
             );
-            if all {
+            let packages = if all {
                 localrepo_packages(&alpm)
                     .into_iter()
                     .map(|pkg| pkg.name().to_owned())
                     .collect()
             } else {
-                packages.into_iter().collect()
-            }
+                packages
+                    .into_iter()
+                    .flat_map(|p| {
+                        let repo_pkg = alpm.repo_package(&p);
+                        let localrepo_pkgs: Vec<_> = repo_pkg
+                            .iter()
+                            .filter(|(db, _)| *db == "localrepo")
+                            .map(|(_, pkg)| pkg.name().to_owned())
+                            .collect();
+                        if localrepo_pkgs.is_empty() {
+                            if let Some((repo, _)) = repo_pkg.first() {
+                                println!("Package {p} already exists in {repo}");
+                                Vec::new()
+                            } else {
+                                // Package not found in any repo, query aur
+                                vec![p]
+                            }
+                        } else {
+                            if localrepo_pkgs.len() > 1 || localrepo_pkgs[0] != p {
+                                println!("Mapping {} to [{}]", p, localrepo_pkgs.join(", "));
+                            }
+                            localrepo_pkgs
+                        }
+                    })
+                    .collect()
+            };
+            (packages, vcs)
         }
         _ => unreachable!(),
     };
@@ -953,8 +1121,7 @@ async fn main() {
         let aur_info: Vec<(_, _)> =
             // TODO: before querying aur, search for package in local dbs.
             get_aur_info(pending.iter().map(|s| s.as_str()))
-                .await
-                .unwrap()
+                .await?
                 .into_iter()
                 .map(|p| (p.pkgbase.clone(), p))
                 .collect();
@@ -969,42 +1136,40 @@ async fn main() {
                 p
             );
             tracing::info!("Searching for {} in aur", search_url);
-            let mut search_result: AurResult<AurSearch> = reqwest::get(&search_url)
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+            let mut search_result: AurResult<AurSearch> =
+                reqwest::get(&search_url).await?.json().await?;
             if search_result.results.is_empty() {
                 tracing::error!("No results found for {}", p);
                 panic!();
             }
-            // Prompt the user to select one of the results.
-            println!("Found multiple results for {}:", p);
-            println!("(v: votes, p: popularity)");
-            search_result.results.sort_by_key(|a| -a.popularity);
-            for (i, result) in search_result.results.iter().enumerate() {
-                println!(
-                    "\t{}) {} (v: {}, p: {})",
-                    i, result.name, result.num_votes, result.popularity
-                );
-            }
-            let mut rl = rustyline::DefaultEditor::new().unwrap();
-            let readline = rl.readline("Select one: ").unwrap().parse::<u32>().unwrap();
-            assert!(readline < search_result.results.len() as u32);
-            let old = disambiguous.insert(p, search_result.results[readline as usize].name.clone());
+            let choice = multi_progress.suspend(|| {
+                // Prompt the user to select one of the results.
+                println!("Found multiple results for {}:", p);
+                println!("(v: votes, p: popularity)");
+                search_result.results.sort_by_key(|a| -a.popularity);
+                for (i, result) in search_result.results.iter().enumerate() {
+                    println!(
+                        "\t{}) {} (v: {}, p: {})\n\t    {}",
+                        i, result.name, result.num_votes, result.popularity, result.description
+                    );
+                }
+                let mut rl = rustyline::DefaultEditor::new()?;
+                rl.readline("Select one: ")?.parse::<u32>().map_err(Error::from)
+            })? as usize;
+            assert!(choice < search_result.results.len());
+            let old = disambiguous.insert(p, search_result.results[choice].name.clone());
             assert!(old.is_none());
             aur_info.insert(
-                search_result.results[readline as usize]
+                search_result.results[choice]
                     .package_base
                     .clone(),
                 PackageInfo {
-                    name: search_result.results[readline as usize].name.clone(),
-                    pkgbase: search_result.results[readline as usize]
+                    name: search_result.results[choice].name.clone(),
+                    pkgbase: search_result.results[choice]
                         .package_base
                         .clone(),
                     version: alpm::Version::new(
-                        search_result.results[readline as usize].version.clone(),
+                        search_result.results[choice].version.clone(),
                     ),
                 },
             );
@@ -1013,13 +1178,20 @@ async fn main() {
         let o = futures::future::try_join_all(aur_info.into_values().map(|aur_info| {
             tracing::info!("Fetching srcinfo for {}", aur_info.pkgbase);
             let resolve_conflicts_tx = resolve_conflicts_tx.clone();
+            let pb = multi_progress.add(indicatif::ProgressBar::new_spinner());
             #[allow(clippy::redundant_async_block)]
             Box::pin(async move {
-                update_one_repo(aur_info.name, &aur_info.version, resolve_conflicts_tx).await
+                update_one_repo(
+                    aur_info.name,
+                    &aur_info.version,
+                    update_vcs,
+                    pb,
+                    resolve_conflicts_tx,
+                )
+                .await
             })
         }))
-        .await
-        .unwrap();
+        .await?;
         pending.clear();
         for srcinfo in o {
             for pkg in &srcinfo.pkgs {
@@ -1036,7 +1208,7 @@ async fn main() {
                 }
                 let repo_of_dep = alpm.repo_of(dep.name());
                 if repo_of_dep.len() > 1 && repo_of_dep.contains(&"localrepo") {
-                    tracing::warn!("{} is in multiple repos: {:?}", dep, repo_of_dep);
+                    tracing::info!("{} is in multiple repos: {:?}", dep, repo_of_dep);
                 }
                 if let Some(&repo) = repo_of_dep.iter().find(|&&r| r != "localrepo") {
                     tracing::info!("{} comes from {}", dep, repo);
@@ -1056,7 +1228,7 @@ async fn main() {
                     // We have a package in localrepo for this dep, use its information
                     // Like sometimes multiple package can have the same provides, it
                     // being already in localrepo means the user has already made a choice.
-                    let pkg = alpm.repo_package(dep.name()).unwrap();
+                    let (_, pkg) = alpm.repo_package(dep.name()).into_iter().next().unwrap();
                     if dep.name() != pkg.name() {
                         let old = disambiguous.insert(dep.name().to_owned(), pkg.name().to_owned());
                         if let Some(old) = old {
@@ -1071,6 +1243,7 @@ async fn main() {
             all_srcinfos.push(srcinfo);
         }
     }
+    multi_progress.set_draw_target(indicatif::ProgressDrawTarget::hidden());
     for srcinfo in &all_srcinfos {
         let node = index_map[&srcinfo.base.pkgbase];
         for (pkgname, dep) in srcinfo_to_depends(srcinfo) {
@@ -1114,7 +1287,7 @@ async fn main() {
             scc.into_iter().flatten().collect()
         }
     };
-    let mut gpgme = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp).unwrap();
+    let mut gpgme = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
     let base = base_dir();
     let mut to_build = Vec::new();
     let mut missing_keys = HashMap::new();
@@ -1125,8 +1298,12 @@ async fn main() {
             let repo_ver = srcinfo
                 .pkgs
                 .iter()
-                .find_map(|p| alpm.repo_package(&p.pkgname))
-                .map(|p| p.version());
+                .filter_map(|p| alpm.repo_package(&p.pkgname).into_iter().next())
+                .map(|(db, p)| {
+                    assert_eq!(db, "localrepo");
+                    p.version()
+                })
+                .next();
             let our_ver = format!("{}-{}", srcinfo.base.pkgver, srcinfo.base.pkgrel);
             let our_ver = alpm::Version::new(our_ver);
             let newer = repo_ver.map_or(true, |v| our_ver > v);
@@ -1139,7 +1316,7 @@ async fn main() {
                             missing_keys.insert(key.as_str(), srcinfo.base.pkgbase.as_str());
                         }
                         e @ Err(_) => {
-                            e.unwrap();
+                            e?;
                         }
                         Ok(_) => (),
                     }
@@ -1157,21 +1334,21 @@ async fn main() {
 
     if to_build.is_empty() {
         println!("Nothing to do");
-        return;
+        return Ok(());
     }
 
-    let mut rl = rustyline::DefaultEditor::new().unwrap();
-    let readline = rl.readline("Proceed? [y/N] ").unwrap();
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let readline = rl.readline("Proceed? [y/N] ")?;
     if readline != "Y" && readline != "y" {
-        return;
+        return Ok(());
     }
 
     // import missing keys
-    gpgme.set_key_list_mode(gpgme::KeyListMode::EXTERN).unwrap();
+    gpgme.set_key_list_mode(gpgme::KeyListMode::EXTERN)?;
     for (key, pkg) in missing_keys {
         println!("Missing key {} for {}", key, pkg);
-        let keys: Result<Vec<_>, _> = gpgme.find_keys(Some(key)).unwrap().collect();
-        let keys = keys.unwrap();
+        let keys: Result<Vec<_>, _> = gpgme.find_keys(Some(key))?.collect();
+        let keys = keys?;
         for key in &keys {
             println!("User IDs:");
             for user_id in key.user_ids() {
@@ -1187,28 +1364,27 @@ async fn main() {
                 );
             }
         }
-        let readline = rl.readline("Import? [y/N] ").unwrap();
+        let readline = rl.readline("Import? [y/N] ")?;
         if readline == "Y" || readline == "y" {
-            gpgme.import_keys(&keys).unwrap();
+            gpgme.import_keys(&keys)?;
         } else {
             println!("Key rejected, cannot continue");
-            return;
+            return Ok(());
         }
     }
 
     let mut runner_com = if !opts.dry_run {
         // Start the runner
-        check_fd().unwrap();
+        check_fd()?;
 
-        let (runner_tx, runner_rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (runner_tx, runner_rx) = std::os::unix::net::UnixStream::pair()?;
         let ownedfd: OwnedFd = runner_rx.into();
-        std::process::Command::new(std::env::current_exe().unwrap())
+        std::process::Command::new(std::env::current_exe()?)
             .arg("runner")
             .stdout(ownedfd)
             .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let result: BuildResult = bincode::deserialize_from(&runner_tx).unwrap();
+            .spawn()?;
+        let result: BuildResult = bincode::deserialize_from(&runner_tx)?;
         assert!(result.success);
         Some(runner_tx)
     } else {
@@ -1217,20 +1393,17 @@ async fn main() {
     let total = to_build.len();
     for (i, srcinfo) in to_build.into_iter().rev().enumerate() {
         use crossterm::ExecutableCommand;
-        stdout()
-            .execute(crossterm::terminal::SetTitle(format!(
-                "building {} ({}/{})",
-                srcinfo.base.pkgbase,
-                i + 1,
-                total
-            )))
-            .unwrap();
+        stdout().execute(crossterm::terminal::SetTitle(format!(
+            "building {} ({}/{})",
+            srcinfo.base.pkgbase,
+            i + 1,
+            total
+        )))?;
         build(
             base.join(&srcinfo.base.pkgbase),
             &srcinfo,
             runner_com.as_mut(),
-        )
-        .unwrap();
+        )?;
     }
     if let Some(runner_com) = runner_com {
         bincode::serialize_into(
@@ -1241,7 +1414,19 @@ async fn main() {
                 depends: Vec::new(),
                 quit: true,
             },
-        )
-        .unwrap();
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let fut = run();
+    tokio::select! {
+        res = fut => res,
+        _ = tokio::signal::ctrl_c() => {
+            println!("Ctrl-C pressed, exiting");
+            Ok(())
+        }
     }
 }
