@@ -457,7 +457,9 @@ async fn update_one_repo(
                             Some(Ok(line)) =>  {
                                 output.push_str(&line);
                                 output.push('\n');
-                                progress.set_message(format!("{}: vcs: {}", srcinfo.base.pkgbase, &line));
+                                let message = format!("{}: vcs: {}", srcinfo.base.pkgbase, &line);
+                                progress.set_message(message);
+                                progress.tick();
                             },
                             None => break child.wait().await?,
                             Some(Err(e)) if e.raw_os_error() == Some(5) => break child.wait().await?, // EIO means the child closed their pts
@@ -467,6 +469,7 @@ async fn update_one_repo(
                     }
                     _ = timer.tick() => {
                         progress.inc(1);
+                        progress.tick();
                     }
                 }
             };
@@ -1154,23 +1157,19 @@ async fn run() -> Result<(), Error> {
                     );
                 }
                 let mut rl = rustyline::DefaultEditor::new()?;
-                rl.readline("Select one: ")?.parse::<u32>().map_err(Error::from)
+                rl.readline("Select one: ")?
+                    .parse::<u32>()
+                    .map_err(Error::from)
             })? as usize;
             assert!(choice < search_result.results.len());
             let old = disambiguous.insert(p, search_result.results[choice].name.clone());
             assert!(old.is_none());
             aur_info.insert(
-                search_result.results[choice]
-                    .package_base
-                    .clone(),
+                search_result.results[choice].package_base.clone(),
                 PackageInfo {
                     name: search_result.results[choice].name.clone(),
-                    pkgbase: search_result.results[choice]
-                        .package_base
-                        .clone(),
-                    version: alpm::Version::new(
-                        search_result.results[choice].version.clone(),
-                    ),
+                    pkgbase: search_result.results[choice].package_base.clone(),
+                    version: alpm::Version::new(search_result.results[choice].version.clone()),
                 },
             );
         }
@@ -1193,10 +1192,15 @@ async fn run() -> Result<(), Error> {
         }))
         .await?;
         pending.clear();
-        for srcinfo in o {
+        // Don't append to pending while we iterating over fetched srcinfo, 
+        // because we might end up appending something we already fetched, but haven't
+        // reached it in the iteration.
+        for srcinfo in &o {
             for pkg in &srcinfo.pkgs {
                 package_base_map.insert(pkg.pkgname.clone(), srcinfo.base.pkgbase.clone());
             }
+        }
+        for srcinfo in o {
             let node = dep_graph.add_node(DepNode {
                 srcinfo: Some(srcinfo.clone()),
                 name: srcinfo.base.pkgbase.clone(),
@@ -1308,7 +1312,12 @@ async fn run() -> Result<(), Error> {
             let our_ver = alpm::Version::new(our_ver);
             let newer = repo_ver.map_or(true, |v| our_ver > v);
             if newer {
-                println!("{}", srcinfo.base.pkgbase);
+                println!(
+                    "{}, {} => {}",
+                    srcinfo.base.pkgbase,
+                    repo_ver.map(ToString::to_string).unwrap_or("_".to_owned()),
+                    our_ver
+                );
                 to_build.push(srcinfo.clone());
                 for key in &srcinfo.base.valid_pgp_keys {
                     match gpgme.get_key(key) {
